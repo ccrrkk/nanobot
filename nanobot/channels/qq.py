@@ -2,7 +2,10 @@
 
 import asyncio
 from collections import deque
+import mimetypes
+import tempfile
 from typing import TYPE_CHECKING
+import aiohttp
 
 from loguru import logger
 
@@ -110,6 +113,23 @@ class QQChannel(BaseChannel):
         except Exception as e:
             logger.error(f"Error sending QQ message: {e}")
 
+    async def _download_media(self, url: str) -> str | None:
+        """Download media to a temporary file."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        content_type = response.headers.get("Content-Type", "")
+                        ext = mimetypes.guess_extension(content_type) or ".jpg"
+
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+                            tf.write(content)
+                            return tf.name
+        except Exception as e:
+            logger.error(f"Failed to download media: {e}")
+        return None
+
     async def _on_message(self, data: "C2CMessage") -> None:
         """Handle incoming message from QQ."""
         try:
@@ -120,15 +140,49 @@ class QQChannel(BaseChannel):
 
             author = data.author
             user_id = str(getattr(author, 'id', None) or getattr(author, 'user_openid', 'unknown'))
-            content = (data.content or "").strip()
-            if not content:
+            raw_content = (data.content or "").strip()
+
+            # --- 指令解析与上下文管理 ---
+            content = raw_content
+            metadata = {"message_id": data.id}
+
+            if content.startswith("/"):
+                # 分割指令，最多分3部分：/cmd arg text
+                parts = content.split(" ", 2)
+                cmd = parts[0].lower()
+
+                # 1. 重置指令：/reset
+                # 告诉 Agent 清空当前会话的历史记录
+                if cmd == "/reset":
+                    metadata["reset_session"] = True
+                    content = "Reset conversation context." # 替换提示语
+                
+                # 2. 上下文长度指令：/context 10 [后续消息]
+                # 临时指定本次对话读取的历史消息数量
+                elif cmd == "/context":
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        metadata["memory_window"] = int(parts[1])
+                        # 如果后面还有内容，则作为本次消息内容；否则仅作为系统设置提示
+                        content = parts[2] if len(parts) > 2 else f"Set context window to {parts[1]}"
+            # ---------------------------
+
+            # Handle attachments (images)
+            media = []
+            if hasattr(data, "attachments") and data.attachments:
+                for att in data.attachments:
+                    if hasattr(att, "url") and att.url:
+                        if path := await self._download_media(att.url):
+                            media.append(path)
+
+            if not content and not media:
                 return
 
             await self._handle_message(
                 sender_id=user_id,
                 chat_id=user_id,
-                content=content,
-                metadata={"message_id": data.id},
+                content=content or "[Image Message]",
+                metadata=metadata,
+                media=media,
             )
         except Exception as e:
             logger.error(f"Error handling QQ message: {e}")

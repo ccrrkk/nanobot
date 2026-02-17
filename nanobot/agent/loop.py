@@ -60,18 +60,22 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations  # 防止代理陷入死循环的最大迭代次数
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.memory_window = memory_window
+        self.memory_window = memory_window    # 保持在上下文窗口中的历史消息数量
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
+        # 上下文构建器：负责组装 System Prompt 和消息历史
         self.context = ContextBuilder(workspace)
+        # 会话管理器：负责加载/保存对话状态
         self.sessions = session_manager or SessionManager(workspace)
+        # 工具注册表：管理所有可用工具
         self.tools = ToolRegistry()
+        # 子代理管理器：处理 SpawnTool 创建的子任务
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -85,6 +89,7 @@ class AgentLoop:
         )
         
         self._running = False
+        # MCP (Model Context Protocol) 相关配置
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
@@ -150,6 +155,8 @@ class AgentLoop:
         """
         Run the agent iteration loop.
 
+        This is the "Think -> Act -> Observe" pattern.
+
         Args:
             initial_messages: Starting messages for the LLM conversation.
 
@@ -161,18 +168,22 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
 
+        # Loop until max iterations (prevent infinite loops)
         while iteration < self.max_iterations:
             iteration += 1
 
+            # 1. Call LLM
             response = await self.provider.chat(
                 messages=messages,
-                tools=self.tools.get_definitions(),
+                tools=self.tools.get_definitions(), # Inject tool definitions
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
 
+            # 2. Check for tool calls
             if response.has_tool_calls:
+                # Add LLM's decisions to message history
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -189,16 +200,24 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
 
+                # 3. Execute tools
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    
+                    # Actually execute Python function
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    
+                    # 4. Add tool result (Observation) back to message history
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                
+                # Prompt LLM to reflect on results
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
+                # If no tool calls, LLM considers task complete
                 final_content = response.content
                 break
 
@@ -212,11 +231,13 @@ class AgentLoop:
 
         while self._running:
             try:
+                # Get message (with timeout to respond to stop signals)
                 msg = await asyncio.wait_for(
                     self.bus.consume_inbound(),
                     timeout=1.0
                 )
                 try:
+                    # Process message and get possible direct response
                     response = await self._process_message(msg)
                     if response:
                         await self.bus.publish_outbound(response)
@@ -247,11 +268,11 @@ class AgentLoop:
     async def _process_message(self, msg: InboundMessage, session_key: str | None = None) -> OutboundMessage | None:
         """
         Process a single inbound message.
-        
+
         Args:
             msg: The inbound message to process.
             session_key: Override session key (used by process_direct).
-        
+
         Returns:
             The response message, or None if no response needed.
         """
@@ -262,6 +283,7 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
         
+        # Get or create session state
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
         
@@ -272,9 +294,10 @@ class AgentLoop:
             messages_to_archive = session.messages.copy()
             session.clear()
             self.sessions.save(session)
-            self.sessions.invalidate(session.key)
+            self.sessions.invalidate(session.key) # Clear cache
 
             async def _consolidate_and_cleanup():
+                # Use temporary object for archiving
                 temp_session = Session(key=session.key)
                 temp_session.messages = messages_to_archive
                 await self._consolidate_memory(temp_session, archive_all=True)
@@ -286,10 +309,15 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
         
+        # ------ Automatic Memory Consolidation ------
+        # If current session exceeds window limit, trigger background consolidation
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
+        # ------ Prepare context and run agent ------
         self._set_tool_context(msg.channel, msg.chat_id)
+        
+        # Build complete Prompt (System Prompt, long-term memory, recent history)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -297,11 +325,14 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        
+        # *** Execute core Think-Act-Observation loop ***
         final_content, tools_used = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
         
+        # ------ Update session history and save ------
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
         
@@ -310,6 +341,7 @@ class AgentLoop:
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
         
+        # Return response
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
@@ -320,7 +352,7 @@ class AgentLoop:
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
-        
+
         The chat_id field contains "original_channel:original_chat_id" to route
         the response back to the correct destination.
         """
@@ -338,6 +370,8 @@ class AgentLoop:
         
         session_key = f"{origin_channel}:{origin_chat_id}"
         session = self.sessions.get_or_create(session_key)
+        
+        # Run agent loop for system messages (usually for summarizing subagent behavior)
         self._set_tool_context(origin_channel, origin_chat_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
@@ -350,6 +384,7 @@ class AgentLoop:
         if final_content is None:
             final_content = "Background task completed."
         
+        # Record to history, marked as System source
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
         session.add_message("assistant", final_content)
         self.sessions.save(session)
@@ -374,21 +409,25 @@ class AgentLoop:
             keep_count = 0
             logger.info(f"Memory consolidation (archive_all): {len(session.messages)} total messages archived")
         else:
+            # Default strategy: keep half of the messages
             keep_count = self.memory_window // 2
             if len(session.messages) <= keep_count:
                 logger.debug(f"Session {session.key}: No consolidation needed (messages={len(session.messages)}, keep={keep_count})")
                 return
 
+            # Calculate if there are enough new messages to consolidate
             messages_to_process = len(session.messages) - session.last_consolidated
             if messages_to_process <= 0:
                 logger.debug(f"Session {session.key}: No new messages to consolidate (last_consolidated={session.last_consolidated}, total={len(session.messages)})")
                 return
 
+            # Slice out old messages
             old_messages = session.messages[session.last_consolidated:-keep_count]
             if not old_messages:
                 return
             logger.info(f"Memory consolidation started: {len(session.messages)} total, {len(old_messages)} new to consolidate, {keep_count} keep")
 
+        # Convert messages to text for LLM summary
         lines = []
         for m in old_messages:
             if not m.get("content"):
@@ -398,6 +437,7 @@ class AgentLoop:
         conversation = "\n".join(lines)
         current_memory = memory.read_long_term()
 
+        # Generate Prompt, require LLM to return JSON summary
         prompt = f"""You are a memory consolidation agent. Process this conversation and return a JSON object with exactly two keys:
 
 1. "history_entry": A paragraph (2-5 sentences) summarizing the key events/decisions/topics. Start with a timestamp like [YYYY-MM-DD HH:MM]. Include enough detail to be useful when found by grep search later.
@@ -413,6 +453,7 @@ class AgentLoop:
 Respond with ONLY valid JSON, no markdown fences."""
 
         try:
+            # Use LLM for summarization
             response = await self.provider.chat(
                 messages=[
                     {"role": "system", "content": "You are a memory consolidation agent. Respond only with valid JSON."},
@@ -420,6 +461,7 @@ Respond with ONLY valid JSON, no markdown fences."""
                 ],
                 model=self.model,
             )
+            # Parse JSON response (with error handling)
             text = (response.content or "").strip()
             if not text:
                 logger.warning("Memory consolidation: LLM returned empty response, skipping")
@@ -431,12 +473,14 @@ Respond with ONLY valid JSON, no markdown fences."""
                 logger.warning(f"Memory consolidation: unexpected response type, skipping. Response: {text[:200]}")
                 return
 
+            # Write to file system
             if entry := result.get("history_entry"):
                 memory.append_history(entry)
             if update := result.get("memory_update"):
                 if update != current_memory:
                     memory.write_long_term(update)
 
+            # Update session cursor
             if archive_all:
                 session.last_consolidated = 0
             else:
@@ -454,13 +498,13 @@ Respond with ONLY valid JSON, no markdown fences."""
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
-        
+
         Args:
             content: The message content.
             session_key: Session identifier (overrides channel:chat_id for session lookup).
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
-        
+
         Returns:
             The agent's response.
         """
