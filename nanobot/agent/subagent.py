@@ -48,6 +48,7 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        # 跟踪当前正在运行的异步任务，以便管理生命周期
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
     
     async def spawn(
@@ -58,7 +59,7 @@ class SubagentManager:
         origin_chat_id: str = "direct",
     ) -> str:
         """
-        Spawn a subagent to execute a task in the background.
+        派生一个子代理在后台执行任务。
         
         Args:
             task: The task description for the subagent.
@@ -67,7 +68,7 @@ class SubagentManager:
             origin_chat_id: The chat ID to announce results to.
         
         Returns:
-            Status message indicating the subagent was started.
+            状态消息，指示子代理已启动。
         """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
@@ -77,13 +78,13 @@ class SubagentManager:
             "chat_id": origin_chat_id,
         }
         
-        # Create background task
+        # 创建不阻塞主流程的异步任务
         bg_task = asyncio.create_task(
             self._run_subagent(task_id, task, display_label, origin)
         )
         self._running_tasks[task_id] = bg_task
         
-        # Cleanup when done
+        # 任务完成后自动从运行列表中移除
         bg_task.add_done_callback(lambda _: self._running_tasks.pop(task_id, None))
         
         logger.info(f"Spawned subagent [{task_id}]: {display_label}")
@@ -96,11 +97,11 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
     ) -> None:
-        """Execute the subagent task and announce the result."""
+        """执行子代代理任务并发布结果。"""
         logger.info(f"Subagent [{task_id}] starting task: {label}")
         
         try:
-            # Build subagent tools (no message tool, no spawn tool)
+            # 构建子代理工具集（剔除消息发送和递归派生工具，确保安全隔离）
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(allowed_dir=allowed_dir))
@@ -115,14 +116,14 @@ class SubagentManager:
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
             
-            # Build messages with subagent-specific prompt
+            # 初始化消息列表，包含子代理专属的系统提示词
             system_prompt = self._build_subagent_prompt(task)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
             ]
             
-            # Run agent loop (limited iterations)
+            # 运行智能体循环（硬编码最大迭代次数，防止后台死循环耗尽 Token）
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
@@ -139,7 +140,7 @@ class SubagentManager:
                 )
                 
                 if response.has_tool_calls:
-                    # Add assistant message with tool calls
+                    # 处理 LLM 生成的工具调用请求
                     tool_call_dicts = [
                         {
                             "id": tc.id,
@@ -157,7 +158,7 @@ class SubagentManager:
                         "tool_calls": tool_call_dicts,
                     })
                     
-                    # Execute tools
+                    # 依次执行工具并收集观察结果（Observation）
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments)
                         logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
@@ -169,6 +170,7 @@ class SubagentManager:
                             "content": result,
                         })
                 else:
+                    # 无工具调用，表示任务完成或得出最终结论
                     final_result = response.content
                     break
             
@@ -192,19 +194,20 @@ class SubagentManager:
         origin: dict[str, str],
         status: str,
     ) -> None:
-        """Announce the subagent result to the main agent via the message bus."""
+        """通过消息总线向主代理通知子代理的执行结果。"""
         status_text = "completed successfully" if status == "ok" else "failed"
         
+        # 构造一个特殊的系统提示，引导主代理以自然语言向用户汇报
         announce_content = f"""[Subagent '{label}' {status_text}]
 
-Task: {task}
+        Task: {task}
 
-Result:
-{result}
+        Result:
+        {result}
 
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+        Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
         
-        # Inject as system message to trigger main agent
+        # 注入为 system 渠道的消息，这会触发主代理的 context_builder 感知到任务完成
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
@@ -224,33 +227,33 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
         return f"""# Subagent
 
-## Current Time
-{now} ({tz})
+        ## Current Time
+        {now} ({tz})
 
-You are a subagent spawned by the main agent to complete a specific task.
+        You are a subagent spawned by the main agent to complete a specific task.
 
-## Rules
-1. Stay focused - complete only the assigned task, nothing else
-2. Your final response will be reported back to the main agent
-3. Do not initiate conversations or take on side tasks
-4. Be concise but informative in your findings
+        ## Rules
+        1. Stay focused - complete only the assigned task, nothing else
+        2. Your final response will be reported back to the main agent
+        3. Do not initiate conversations or take on side tasks
+        4. Be concise but informative in your findings
 
-## What You Can Do
-- Read and write files in the workspace
-- Execute shell commands
-- Search the web and fetch web pages
-- Complete the task thoroughly
+        ## What You Can Do
+        - Read and write files in the workspace
+        - Execute shell commands
+        - Search the web and fetch web pages
+        - Complete the task thoroughly
 
-## What You Cannot Do
-- Send messages directly to users (no message tool available)
-- Spawn other subagents
-- Access the main agent's conversation history
+        ## What You Cannot Do
+        - Send messages directly to users (no message tool available)
+        - Spawn other subagents
+        - Access the main agent's conversation history
 
-## Workspace
-Your workspace is at: {self.workspace}
-Skills are available at: {self.workspace}/skills/ (read SKILL.md files as needed)
+        ## Workspace
+        Your workspace is at: {self.workspace}
+        Skills are available at: {self.workspace}/skills/ (read SKILL.md files as needed)
 
-When you have completed the task, provide a clear summary of your findings or actions."""
+        When you have completed the task, provide a clear summary of your findings or actions."""
     
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

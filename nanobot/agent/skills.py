@@ -20,22 +20,24 @@ class SkillsLoader:
     
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
         self.workspace = workspace
+        # 工作区技能目录（优先级最高，允许用户覆盖内置技能）
         self.workspace_skills = workspace / "skills"
+        # 内置技能目录
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
     
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
-        List all available skills.
+        列出所有已发现的技能。
         
         Args:
-            filter_unavailable: If True, filter out skills with unmet requirements.
+            filter_unavailable: 是否过滤掉由于缺少环境或依赖而不可用的技能。
         
         Returns:
-            List of skill info dicts with 'name', 'path', 'source'.
+            包含技能信息的字典列表（名称、路径、来源）。
         """
         skills = []
         
-        # Workspace skills (highest priority)
+        # 1. 扫描工作区技能：具有最高优先级
         if self.workspace_skills.exists():
             for skill_dir in self.workspace_skills.iterdir():
                 if skill_dir.is_dir():
@@ -43,35 +45,36 @@ class SkillsLoader:
                     if skill_file.exists():
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
         
-        # Built-in skills
+        # 2. 扫描内置技能：添加未在工作区中定义的技能
         if self.builtin_skills and self.builtin_skills.exists():
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
+                    # 如果技能名已存在（已被工作区覆盖），则跳过
                     if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
         
-        # Filter by requirements
+        # 3. 按依赖需求过滤
         if filter_unavailable:
             return [s for s in skills if self._check_requirements(self._get_skill_meta(s["name"]))]
         return skills
     
     def load_skill(self, name: str) -> str | None:
         """
-        Load a skill by name.
+        根据名称加载技能文件内容。
         
         Args:
-            name: Skill name (directory name).
+            name: 技能名称（即所在的目录名）。
         
         Returns:
-            Skill content or None if not found.
+            SKILL.md 的完整文本内容，未找到则返回 None。
         """
-        # Check workspace first
+        # 优先检查工作区
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
             return workspace_skill.read_text(encoding="utf-8")
         
-        # Check built-in
+        # 其次检查内置目录
         if self.builtin_skills:
             builtin_skill = self.builtin_skills / name / "SKILL.md"
             if builtin_skill.exists():
@@ -93,6 +96,7 @@ class SkillsLoader:
         for name in skill_names:
             content = self.load_skill(name)
             if content:
+                # 移除 YAML frontmatter，只保留正文指导
                 content = self._strip_frontmatter(content)
                 parts.append(f"### Skill: {name}\n\n{content}")
         
@@ -123,12 +127,13 @@ class SkillsLoader:
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
             
+            # available 属性告诉 Agent 该技能当前是否由于缺少环境而无法运行
             lines.append(f"  <skill available=\"{str(available).lower()}\">")
             lines.append(f"    <name>{name}</name>")
             lines.append(f"    <description>{desc}</description>")
             lines.append(f"    <location>{path}</location>")
             
-            # Show missing requirements for unavailable skills
+            # 如果不可用，列出缺失的具体依赖项
             if not available:
                 missing = self._get_missing_requirements(skill_meta)
                 if missing:
@@ -143,23 +148,25 @@ class SkillsLoader:
         """Get a description of missing requirements."""
         missing = []
         requires = skill_meta.get("requires", {})
+        # 检查二进制文件是否存在于 PATH
         for b in requires.get("bins", []):
             if not shutil.which(b):
                 missing.append(f"CLI: {b}")
+        # 检查环境变量
         for env in requires.get("env", []):
             if not os.environ.get(env):
                 missing.append(f"ENV: {env}")
         return ", ".join(missing)
     
     def _get_skill_description(self, name: str) -> str:
-        """Get the description of a skill from its frontmatter."""
+        """从技能的 frontmatter 中提取描述。"""
         meta = self.get_skill_metadata(name)
         if meta and meta.get("description"):
             return meta["description"]
         return name  # Fallback to skill name
     
     def _strip_frontmatter(self, content: str) -> str:
-        """Remove YAML frontmatter from markdown content."""
+        """使用正则表达式移除 markdown 内容头部的 YAML 块。"""
         if content.startswith("---"):
             match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
             if match:
@@ -167,7 +174,7 @@ class SkillsLoader:
         return content
     
     def _parse_nanobot_metadata(self, raw: str) -> dict:
-        """Parse nanobot metadata JSON from frontmatter."""
+        """解析 frontmatter 中 metadata 字段内的 JSON 字符串。"""
         try:
             data = json.loads(raw)
             return data.get("nanobot", {}) if isinstance(data, dict) else {}
@@ -175,7 +182,13 @@ class SkillsLoader:
             return {}
     
     def _check_requirements(self, skill_meta: dict) -> bool:
-        """Check if skill requirements are met (bins, env vars)."""
+        """
+        验证技能所需的运行环境。
+        
+        包含：
+        1. bins: 系统必须安装的命令行工具。
+        2. env: 系统必须定义的环境变量。
+        """
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -186,16 +199,17 @@ class SkillsLoader:
         return True
     
     def _get_skill_meta(self, name: str) -> dict:
-        """Get nanobot metadata for a skill (cached in frontmatter)."""
+        """获取技能元数据中的 nanobot 配置部分。"""
         meta = self.get_skill_metadata(name) or {}
         return self._parse_nanobot_metadata(meta.get("metadata", ""))
     
     def get_always_skills(self) -> list[str]:
-        """Get skills marked as always=true that meet requirements."""
+        """获取所有标记为 'always: true' 且当前环境满足要求的技能名称列表。"""
         result = []
         for s in self.list_skills(filter_unavailable=True):
             meta = self.get_skill_metadata(s["name"]) or {}
             skill_meta = self._parse_nanobot_metadata(meta.get("metadata", ""))
+            # 兼容两种标记写法
             if skill_meta.get("always") or meta.get("always"):
                 result.append(s["name"])
         return result
@@ -217,7 +231,6 @@ class SkillsLoader:
         if content.startswith("---"):
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if match:
-                # Simple YAML parsing
                 metadata = {}
                 for line in match.group(1).split("\n"):
                     if ":" in line:

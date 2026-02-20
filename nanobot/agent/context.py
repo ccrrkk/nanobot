@@ -1,5 +1,13 @@
 """Context builder for assembling agent prompts."""
 
+"""
+1. system prpmpt: 身份+各个能力文件（AGENTS.md、SOUL.md、USER.md、TOOLS.md、IDENTITY.md）+技能摘要+记忆摘要
+2. messages: system prompt + history + current message (with optional media attachments)
+3. tool results: 添加tool调用结果到消息列表
+4. assistant messages: 添加助手回复到消息列表，包含tool_calls和reasoning_content
+
+"""
+
 import base64
 import mimetypes
 import platform
@@ -63,10 +71,10 @@ class ContextBuilder:
         if skills_summary:
             parts.append(f"""# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+            The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
+            Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
 
-{skills_summary}""")
+            {skills_summary}""")
         
         return "\n\n---\n\n".join(parts)
     
@@ -82,32 +90,32 @@ Skills with available="false" need dependencies installed first - you can try in
         
         return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
-- Read, write, and edit files
-- Execute shell commands
-- Search the web and fetch web pages
-- Send messages to users on chat channels
-- Spawn subagents for complex background tasks
+            You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
+            - Read, write, and edit files
+            - Execute shell commands
+            - Search the web and fetch web pages
+            - Send messages to users on chat channels
+            - Spawn subagents for complex background tasks
 
-## Current Time
-{now} ({tz})
+            ## Current Time
+            {now} ({tz})
 
-## Runtime
-{runtime}
+            ## Runtime
+            {runtime}
 
-## Workspace
-Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
-- Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+            ## Workspace
+            Your workspace is at: {workspace_path}
+            - Long-term memory: {workspace_path}/memory/MEMORY.md
+            - History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
+            - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
-IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
-Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
-For normal conversation, just respond with text - do not call the message tool.
+            IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
+            Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
+            For normal conversation, just respond with text - do not call the message tool.
 
-Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
-When remembering something important, write to {workspace_path}/memory/MEMORY.md
-To recall past events, grep {workspace_path}/memory/HISTORY.md"""
+            Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
+            When remembering something important, write to {workspace_path}/memory/MEMORY.md
+            To recall past events, grep {workspace_path}/memory/HISTORY.md"""
     
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
